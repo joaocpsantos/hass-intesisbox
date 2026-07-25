@@ -1,0 +1,24 @@
+{
+  "entity": {
+    "climate": {
+      "intesisbox": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "auto": "mdi:fan-auto",
+              "1": "mdi:fan-speed-1",
+              "2": "mdi:fan-speed-2",
+              "3": "mdi:fan-speed-3",
+              "4": "mdi:fan",
+              "5": "mdi:fan",
+              "6": "mdi:fan",
+              "7": "mdi:fan",
+              "8": "mdi:fan",
+              "9": "mdi:fan"
+            }
+          }
+        }
+      }
+    }
+  }
+}

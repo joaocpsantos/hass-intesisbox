@@ -175,6 +175,9 @@ class IntesisBoxAC(ClimateEntity):
     """Represents an Intesisbox air conditioning device."""
 
     _attr_should_poll = True
+    # Enables the integration's icon translations (icons.json). Does not affect
+    # the entity name: has_entity_name is False and _attr_name is set explicitly.
+    _attr_translation_key = "intesisbox"
 
     def __init__(
         self,
