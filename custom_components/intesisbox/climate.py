@@ -81,25 +81,26 @@ MAP_OPERATION_MODE_TO_HA = {
 }
 MAP_OPERATION_MODE_TO_IB = {v: k for k, v in MAP_OPERATION_MODE_TO_HA.items()}
 
+
 def _celsius_setpoint_to_fahrenheit(celsius: float) -> int:
-  """Map a °C setpoint echoed by the gateway to its RNNUM °F label."""
-  rounded_c = round(celsius)
-  if rounded_c in CELSIUS_TO_FAHRENHEIT:
-    return CELSIUS_TO_FAHRENHEIT[rounded_c]
-  return round((celsius * 1.8 + 32) / 2) * 2
+    """Map a °C setpoint echoed by the gateway to its RNNUM °F label."""
+    rounded_c = round(celsius)
+    if rounded_c in CELSIUS_TO_FAHRENHEIT:
+        return CELSIUS_TO_FAHRENHEIT[rounded_c]
+    return round((celsius * 1.8 + 32) / 2) * 2
 
 
 def _fahrenheit_setpoint_to_celsius(fahrenheit: float) -> float:
-  """Map a user-requested °F setpoint to the °C value the gateway expects."""
-  snapped_f = int((fahrenheit + 1) // 2 * 2)
-  if snapped_f in FAHRENHEIT_TO_CELSIUS:
-    return float(FAHRENHEIT_TO_CELSIUS[snapped_f])
-  return round((fahrenheit - 32) / 1.8)
+    """Map a user-requested °F setpoint to the °C value the gateway expects."""
+    snapped_f = int((fahrenheit + 1) // 2 * 2)
+    if snapped_f in FAHRENHEIT_TO_CELSIUS:
+        return float(FAHRENHEIT_TO_CELSIUS[snapped_f])
+    return round((fahrenheit - 32) / 1.8)
 
 
 def _celsius_ambient_to_fahrenheit(celsius: float) -> float:
-  """Convert measured ambient °C to °F, preserving 0.1° resolution."""
-  return round(celsius * 1.8 + 32, 1)
+    """Convert measured ambient °C to °F, preserving 0.1° resolution."""
+    return round(celsius * 1.8 + 32, 1)
 
 
 MAP_STATE_ICONS = {

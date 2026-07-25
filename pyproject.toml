@@ -75,6 +75,11 @@ max-complexity = 25
 "tests/*" = [
     "D",  # docstrings
 ]
+"custom_components/intesisbox/IntesisBoxEmulator.py" = [
+    "T201",   # standalone device emulator writes to the console by design
+    "C901",   # emulator command dispatcher is intentionally one function
+    "RUF006", # fire-and-forget serve_forever task is fine in the emulator
+]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true

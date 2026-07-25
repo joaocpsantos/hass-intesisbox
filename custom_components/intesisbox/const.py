@@ -108,8 +108,20 @@ DEFAULT_DISPLAY_FAHRENHEIT = False
 # Fujitsu UTY-RNNUM remote mapping: one button press = 1°C internal = 2°F label.
 # Anchored at 20°C = 68°F. Built from the RNNUM behaviour, not naive arithmetic.
 FAHRENHEIT_TO_CELSIUS = {
-  60: 16, 62: 17, 64: 18, 66: 19, 68: 20,
-  70: 21, 72: 22, 74: 23, 76: 24, 78: 25,
-  80: 26, 82: 27, 84: 28, 86: 29, 88: 30,
+    60: 16,
+    62: 17,
+    64: 18,
+    66: 19,
+    68: 20,
+    70: 21,
+    72: 22,
+    74: 23,
+    76: 24,
+    78: 25,
+    80: 26,
+    82: 27,
+    84: 28,
+    86: 29,
+    88: 30,
 }
 CELSIUS_TO_FAHRENHEIT = {c: f for f, c in FAHRENHEIT_TO_CELSIUS.items()}
