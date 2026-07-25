@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 import logging
 
 from homeassistant.config_entries import ConfigEntry  # type: ignore
