@@ -135,7 +135,6 @@ class IntesisBoxAC(ClimateEntity):
         self._hswing = False
         self._power = False
         self._current_operation = STATE_UNKNOWN
-        self._connection_retries = 0
         self._has_swing_control = self._controller.has_swing_control
 
         # Setup fan list
@@ -236,7 +235,6 @@ class IntesisBoxAC(ClimateEntity):
         )
         if operation_mode == HVACMode.OFF:
             self._controller.set_power_off()
-            self._power = False
         else:
             self._controller.set_mode(MAP_OPERATION_MODE_TO_IB[operation_mode])
 
@@ -285,18 +283,14 @@ class IntesisBoxAC(ClimateEntity):
     async def async_update(self):
         """Copy values from controller dictionary to climate device."""
         if not self._controller.is_connected:
+            # The controller reconnects on its own; this only covers the case
+            # where it somehow settled in a disconnected state with no attempt
+            # pending.
             _LOGGER.warning(
-                "%s: not connected, attempting to reconnect (attempt %d)",
+                "%s: not connected, asking the controller to reconnect",
                 self._devicename,
-                self._connection_retries + 1,
             )
-            await asyncio.sleep(
-                5
-            )  # per device specs, wait minimum 1 second before re-connecting
-            await self.hass.async_add_executor_job(self._controller.connect)
-            self._connection_retries += 1
-        else:
-            self._connection_retries = 0
+            self._controller.connect()
 
         self._power = self._controller.is_on
         self._current_temp = self._controller.ambient_temperature
@@ -400,12 +394,16 @@ class IntesisBoxAC(ClimateEntity):
     @property
     def assumed_state(self) -> bool:
         """If the device is not connected we have to assume state."""
-        return not self._connected
+        return not self._controller.is_connected
 
     @property
     def available(self) -> bool:
-        """If the device hasn't been able to connect, mark as unavailable."""
-        return self._connected or self._connection_retries < 2
+        """Report unavailable while there is no live connection to the device.
+
+        Showing a controllable entity for a device we cannot reach means
+        commands are accepted and quietly dropped.
+        """
+        return self._controller.is_connected
 
     @property
     def current_temperature(self):

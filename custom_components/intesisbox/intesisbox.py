@@ -36,6 +36,23 @@ FUNCTION_ERRCODE = "ERRCODE"
 
 NULL_VALUES = ["-32768", "32768"]
 
+# The device closes the socket after 1 minute without traffic, so ping well
+# inside that window (WMP Protocol Specification, section "Considerations
+# before integrating WMP protocol").
+KEEPALIVE_INTERVAL = 30
+# How often to check that the device is still answering us.
+WATCHDOG_INTERVAL = 10
+# A device that has not answered a single poll or ping for this long is gone,
+# even though the socket still looks open from our side.
+RESPONSE_TIMEOUT = 45
+# How long to wait for a device to acknowledge a command, and how many times
+# to send it before giving up and rebuilding the connection.
+SET_CONFIRM_TIMEOUT = 3
+SET_ATTEMPTS = 2
+# The spec requires at least 1 second between closing and reopening a socket.
+RECONNECT_DELAY = 5
+MAX_RECONNECT_DELAY = 300
+
 background_tasks = set()
 
 
@@ -78,10 +95,19 @@ class IntesisBox(asyncio.Protocol):
         self._rssi: int | None = None
         self._eventLoop = loop
 
-        # Diagnostics: make a silently dead socket visible in the log.
+        # Traffic tracking, so a socket the device stopped answering on can be
+        # told apart from an idle one.
         self._last_rx: float | None = None
         self._last_tx: float | None = None
         self._pending_sets: dict[str, tuple[str, float]] = {}
+
+        # Reconnection handling
+        self._stopped = False
+        self._reconnecting = False
+        self._reconnect_delay = RECONNECT_DELAY
+        # Bumped for every socket, so the polling loops of a replaced
+        # connection stop instead of waking up alongside the new one.
+        self._session = 0
 
         # Limits
         self._operation_list: list[str] = []
@@ -95,28 +121,54 @@ class IntesisBox(asyncio.Protocol):
         """Asyncio callback for a successful connection."""
         _LOGGER.debug("Connected to IntesisBox")
         self._transport = transport
-        ensure_background_task(self.query_initial_state(), self._eventLoop)
+        self._session += 1
+        ensure_background_task(self.query_initial_state(self._session), self._eventLoop)
 
-    async def keep_alive(self):
+    def _session_active(self, session: int) -> bool:
+        """Whether the connection a background loop was started for is still live."""
+        return self.is_connected and session == self._session
+
+    async def keep_alive(self, session: int):
         """Send a keepalive command to reset it's watchdog timer."""
-        while self.is_connected:
+        while self._session_active(session):
             _LOGGER.debug("Sending keepalive")
             self._write("PING")
-            await asyncio.sleep(45)
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
         else:
             _LOGGER.debug("Not connected, skipping keepalive")
 
-    async def poll_ambtemp(self):
+    async def watchdog(self, session: int):
+        """Drop a socket the device has stopped answering on.
+
+        A WMP gateway that goes away without closing the TCP connection leaves
+        us with a socket that still accepts writes, so commands are silently
+        lost. Nothing but the absence of replies gives it away.
+        """
+        while self._session_active(session):
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            if not self._session_active(session):
+                break
+            silence = self._silence()
+            if silence is not None and silence > RESPONSE_TIMEOUT:
+                _LOGGER.warning(
+                    "%s: no reply for %.0fs although the socket is still open, "
+                    "dropping the connection and reconnecting",
+                    self._ip,
+                    silence,
+                )
+                self._force_reconnect()
+                break
+
+    async def poll_ambtemp(self, session: int):
         """Retrieve Ambient Temperature to prevent integration timeouts."""
-        while self.is_connected:
+        while self._session_active(session):
             _LOGGER.debug("Sending AMBTEMP")
             self._write("GET,1:AMBTEMP")
             await asyncio.sleep(10)
-            self._check_silence()
         else:
             _LOGGER.debug("Not connected, skipping Ambient Temp Request")
 
-    async def query_initial_state(self):
+    async def query_initial_state(self, session: int):
         """Fetch configuration from the device upon connection."""
         cmds = [
             "ID",
@@ -127,6 +179,9 @@ class IntesisBox(asyncio.Protocol):
             "LIMITS:VANELR",
         ]
         for cmd in cmds:
+            if session != self._session or self._transport is None:
+                # This socket has been replaced or closed; its setup is moot.
+                return
             self._write(cmd)
             await asyncio.sleep(1)
 
@@ -160,50 +215,56 @@ class IntesisBox(asyncio.Protocol):
             return False
         return True
 
-    def _report_unconfirmed(self):
-        """Warn about commands the device never acknowledged."""
-        now = time.monotonic()
-        for uid, (value, sent_at) in list(self._pending_sets.items()):
-            if now - sent_at < 5:
-                continue
-            del self._pending_sets[uid]
-            _LOGGER.warning(
-                "%s: SET %s=%s sent %.0fs ago was never confirmed by the device "
-                "(last data received %s)",
-                self._ip,
-                uid,
-                value,
-                now - sent_at,
-                self._silence_text(),
-            )
+    def _submit(self, coro, timeout: float | None = None):
+        """Run a coroutine on the device's event loop, from any thread.
 
-    def _check_silence(self):
-        """Warn when the device stopped answering on a socket we still hold open."""
-        self._report_unconfirmed()
-        silence = self._silence()
-        if silence is not None and silence > 60 and self.is_connected:
-            _LOGGER.warning(
-                "%s: no data received for %.0fs while still marked as connected. "
-                "WMP closes idle sockets after 60s, so commands are most likely "
-                "being dropped silently",
-                self._ip,
-                silence,
-            )
+        Entity methods are called in an executor thread, and a transport may
+        only be written to from the thread its loop runs in.
+        """
+        if self._eventLoop is None:
+            _LOGGER.error("%s: no event loop to run %r on", self._ip, coro)
+            coro.close()
+            return None
 
-    def _write(self, cmd):
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is self._eventLoop:
+            ensure_background_task(coro, self._eventLoop)
+            return None
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._eventLoop)
+        except RuntimeError:
+            _LOGGER.warning("%s: event loop is gone, dropping %r", self._ip, coro)
+            coro.close()
+            return None
+
+        if timeout is None:
+            return None
+        try:
+            return future.result(timeout)
+        except TimeoutError:
+            _LOGGER.warning("%s: timed out waiting for %r", self._ip, coro)
+        except Exception:
+            _LOGGER.exception("%s: command failed", self._ip)
+        return None
+
+    def _write(self, cmd) -> bool:
         if not self._can_write(cmd):
-            return
+            return False
         self._transport.write(f"{cmd}\r".encode("ascii"))
         self._last_tx = time.monotonic()
         _LOGGER.debug(f"Data sent: {cmd!r}")
+        return True
 
-    async def _writeasync(self, cmd):
+    async def _writeasync(self, cmd) -> bool:
         """Async write to slow down commands and await response from units."""
-        if self._can_write(cmd):
-            self._transport.write(f"{cmd}\r".encode("ascii"))
-            self._last_tx = time.monotonic()
-            _LOGGER.debug(f"Data sent: {cmd!r}")
+        written = self._write(cmd)
         await asyncio.sleep(1)
+        return written
 
     def data_received(self, data):
         """Asyncio callback when data is received on the socket."""
@@ -220,11 +281,17 @@ class IntesisBox(asyncio.Protocol):
                 # ACK / ERR / PONG carry no colon and used to be discarded here
                 # without a trace.
                 bare = cmd.strip()
-                if bare == "ERR":
+                if bare == "ACK":
+                    # A SET that does not change the value is answered with a
+                    # bare ACK and no CHN, so this is the only confirmation
+                    # some commands ever get.
+                    self._confirm_oldest_set()
+                elif bare == "ERR":
                     _LOGGER.warning(
                         "%s: device answered ERR, it rejected the last command",
                         self._ip,
                     )
+                    self._pending_sets.clear()
                 elif bare:
                     _LOGGER.debug("%s: device answered %r", self._ip, bare)
             if len(cmdList) > 1:
@@ -232,8 +299,12 @@ class IntesisBox(asyncio.Protocol):
                 if cmd == "ID":
                     self._parse_id_received(args)
                     self._connectionStatus = API_AUTHENTICATED
-                    ensure_background_task(self.poll_status(), self._eventLoop)
-                    ensure_background_task(self.poll_ambtemp(), self._eventLoop)
+                    self._reconnect_delay = RECONNECT_DELAY
+                    session = self._session
+                    ensure_background_task(self.poll_status(session), self._eventLoop)
+                    ensure_background_task(self.poll_ambtemp(session), self._eventLoop)
+                    ensure_background_task(self.keep_alive(session), self._eventLoop)
+                    ensure_background_task(self.watchdog(session), self._eventLoop)
                 elif cmd == "CHN,1":
                     self._parse_change_received(args)
                     statusChanged = True
@@ -243,6 +314,24 @@ class IntesisBox(asyncio.Protocol):
 
         if statusChanged:
             self._send_update_callback()
+
+    def _confirm_oldest_set(self):
+        """Mark the longest outstanding command as acknowledged.
+
+        WMP answers on a single socket in order, so a bare ACK belongs to the
+        command that has been waiting the longest.
+        """
+        if not self._pending_sets:
+            return
+        uid = min(self._pending_sets, key=lambda key: self._pending_sets[key][1])
+        value, sent_at = self._pending_sets.pop(uid)
+        _LOGGER.debug(
+            "%s: device acknowledged %s=%s after %.2fs",
+            self._ip,
+            uid,
+            value,
+            time.monotonic() - sent_at,
+        )
 
     def _parse_id_received(self, args):
         # ID:Model,MAC,IP,Protocol,Version,RSSI
@@ -310,6 +399,8 @@ class IntesisBox(asyncio.Protocol):
     def connection_lost(self, exc):
         """Asyncio callback for a lost TCP connection."""
         self._connectionStatus = API_DISCONNECTED
+        self._transport = None
+        self._pending_sets.clear()
         _LOGGER.warning(
             "%s: connection lost (exc=%r, last data received %s)",
             self._ip,
@@ -317,54 +408,80 @@ class IntesisBox(asyncio.Protocol):
             self._silence_text(),
         )
         self._send_update_callback()
+        self._schedule_reconnect()
+
+    def _force_reconnect(self):
+        """Tear down a socket the device is no longer answering on."""
+        transport = self._transport
+        self._connectionStatus = API_DISCONNECTED
+        self._transport = None
+        self._pending_sets.clear()
+        if transport is not None:
+            # abort() rather than close(): there is nothing left to flush to a
+            # device that stopped talking to us.
+            transport.abort()
+        self._send_update_callback()
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        """Queue a reconnection attempt, backing off while the device is away."""
+        if self._stopped or self._reconnecting:
+            return
+        self._reconnecting = True
+        delay = self._reconnect_delay
+        self._reconnect_delay = min(self._reconnect_delay * 2, MAX_RECONNECT_DELAY)
+        _LOGGER.debug("%s: reconnecting in %ss", self._ip, delay)
+        self._submit(self._reconnect_after(delay))
+
+    async def _reconnect_after(self, delay: float):
+        """Wait out the backoff, then reopen the connection."""
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            self._reconnecting = False
+        if not self._stopped and self.is_disconnected:
+            self.connect()
+
+    async def _open_connection(self):
+        """Open the socket, scheduling another attempt if the device is away."""
+        _LOGGER.debug("Opening connection to IntesisBox %s:%s", self._ip, self._port)
+        try:
+            await self._eventLoop.create_connection(lambda: self, self._ip, self._port)
+        except OSError as err:
+            self._connectionStatus = API_DISCONNECTED
+            _LOGGER.warning("%s: connection attempt failed: %s", self._ip, err)
+            self._send_update_callback()
+            self._schedule_reconnect()
 
     def connect(self):
-        """Public method for connecting to IntesisHome API."""
-        if self._connectionStatus == API_DISCONNECTED:
-            self._connectionStatus = API_CONNECTING
-            try:
-                # Must poll to get the authentication token
-                if self._ip and self._port:
-                    # Create asyncio socket
-                    coro = self._eventLoop.create_connection(
-                        lambda: self, self._ip, self._port
-                    )
-                    _LOGGER.debug(
-                        "Opening connection to IntesisBox %s:%s", self._ip, self._port
-                    )
-                    ensure_background_task(coro, self._eventLoop)
-                else:
-                    _LOGGER.debug("Missing IP address or port.")
-                    self._connectionStatus = API_DISCONNECTED
-
-            except Exception as e:
-                _LOGGER.error("%s Exception. %s / %s", type(e), repr(e.args), e)
-                self._connectionStatus = API_DISCONNECTED
-        elif self._connectionStatus == API_CONNECTING:
-            _LOGGER.debug("connect() called but already connecting")
-            if self._transport is None:
-                _LOGGER.warning(
-                    "%s: stuck in %s with no transport, the previous connection "
-                    "attempt never completed",
-                    self._ip,
-                    API_CONNECTING,
-                )
-            elif self._transport.is_closing():
-                _LOGGER.debug(
-                    "Socket is closing while trying to connect. Force reconnection"
-                )
-                self._connectionStatus = API_DISCONNECTED
-                self._transport.close()
-                self._send_update_callback()
+        """Public method for connecting to the IntesisBox."""
+        if self._stopped:
+            return
+        if not self._ip or not self._port:
+            _LOGGER.error("%s: missing IP address or port", self._ip)
+            return
+        if self._connectionStatus != API_DISCONNECTED:
+            _LOGGER.debug(
+                "%s: connect() ignored, already %s", self._ip, self._connectionStatus
+            )
+            return
+        if self._reconnecting:
+            _LOGGER.debug("%s: connect() ignored, a retry is already queued", self._ip)
+            return
+        self._connectionStatus = API_CONNECTING
+        self._submit(self._open_connection())
 
     def stop(self):
-        """Public method for shutting down connectivity with the envisalink."""
+        """Public method for shutting down connectivity with the IntesisBox."""
+        self._stopped = True
         self._connectionStatus = API_DISCONNECTED
-        self._transport.close()
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.close()
 
-    async def poll_status(self, sendcallback=False):
+    async def poll_status(self, session: int):
         """Periodically poll for updates since the controllers don't always update reliably."""
-        while self.is_connected:
+        while self._session_active(session):
             _LOGGER.debug("Polling for update")
             self._write("GET,1:*")
             await asyncio.sleep(60 * 5)  # 5 minutes
@@ -390,46 +507,95 @@ class IntesisBox(asyncio.Protocol):
 
     def _set_value(self, uid: str, value: str | int) -> None:
         """Change a setting on the thermostat."""
-        # Anything still pending from an earlier press never got an answer.
-        self._report_unconfirmed()
-        _LOGGER.debug(
-            "%s: sending SET %s=%s (status=%s, last data received %s)",
+        self._submit(self._send_set(uid, value), timeout=self._set_timeout())
+
+    def _set_timeout(self) -> float:
+        """Worst case time _send_set() needs, plus room to return."""
+        return SET_ATTEMPTS * (1 + SET_CONFIRM_TIMEOUT) + 2
+
+    async def _send_set(self, uid: str, value: str | int) -> bool:
+        """Send a command and wait for the device to acknowledge it.
+
+        The device answers a SET with an ACK, and with a CHN as well when the
+        value actually changes. Silence means the command was lost, which on a
+        half-open socket is the only symptom there is.
+        """
+        for attempt in range(1, SET_ATTEMPTS + 1):
+            _LOGGER.debug(
+                "%s: sending SET %s=%s (attempt %d, status=%s, last data received %s)",
+                self._ip,
+                uid,
+                value,
+                attempt,
+                self._connectionStatus,
+                self._silence_text(),
+            )
+            self._pending_sets[uid] = (str(value), time.monotonic())
+            if not await self._writeasync(f"SET,1:{uid},{value}"):
+                self._pending_sets.pop(uid, None)
+                break
+
+            deadline = time.monotonic() + SET_CONFIRM_TIMEOUT
+            while time.monotonic() < deadline:
+                if uid not in self._pending_sets:
+                    return True
+                await asyncio.sleep(0.2)
+
+            _LOGGER.warning(
+                "%s: SET %s=%s was not acknowledged within %ss",
+                self._ip,
+                uid,
+                value,
+                SET_CONFIRM_TIMEOUT,
+            )
+
+        self._pending_sets.pop(uid, None)
+        _LOGGER.error(
+            "%s: giving up on SET %s=%s, rebuilding the connection",
             self._ip,
             uid,
             value,
-            self._connectionStatus,
-            self._silence_text(),
         )
-        self._pending_sets[uid] = (str(value), time.monotonic())
-        try:
-            asyncio.run(self._writeasync(f"SET,1:{uid},{value}"))
-        except Exception:
-            _LOGGER.exception("%s: failed to send SET %s=%s", self._ip, uid, value)
+        self._force_reconnect()
+        return False
 
     def set_mode(self, mode):
         """Send mode and confirm change before turning on."""
-        """Some units return responses out of order"""
         _LOGGER.debug(f"Setting MODE to {mode}.")
-        if mode in MODES:
-            self._set_value(FUNCTION_MODE, mode)
+        if mode not in MODES:
+            _LOGGER.error("%s: unsupported mode %s", self._ip, mode)
+            return
+        self._submit(self._apply_mode(mode), timeout=self._set_timeout() * 3)
+
+    async def _apply_mode(self, mode) -> None:
+        """Set the mode, then power on once the device reports it.
+
+        Some units answer out of order, so the mode is read back rather than
+        assumed before switching the unit on.
+        """
+        if not await self._send_set(FUNCTION_MODE, mode):
+            return
+
+        deadline = time.monotonic() + SET_CONFIRM_TIMEOUT
+        while self.mode != mode and time.monotonic() < deadline:
+            _LOGGER.debug(
+                f"Waiting for MODE to return {mode}, currently {str(self.mode)}"
+            )
+            await self._writeasync("GET,1:MODE")
+
+        if self.mode != mode:
+            _LOGGER.error(
+                "%s: device still reports MODE=%s after being set to %s, "
+                "not turning it on",
+                self._ip,
+                self.mode,
+                mode,
+            )
+            return
+
         if not self.is_on:
-            """Check to ensure in correct mode before turning on"""
-            retry = 30
-            while self.mode != mode and retry > 0:
-                _LOGGER.debug(
-                    f"Waiting for MODE to return {mode}, currently {str(self.mode)}"
-                )
-                _LOGGER.debug(f"Retry attempt = {retry}")
-                asyncio.run(self._writeasync("GET,1:MODE"))
-                retry -= 1
-            else:
-                if retry != 0:
-                    _LOGGER.debug(
-                        f"MODE confirmed now {str(self.mode)}, proceed to Power On"
-                    )
-                    self.set_power_on()
-                else:
-                    _LOGGER.error("Cannot set Intesisbox mode giving up...")
+            _LOGGER.debug(f"MODE confirmed now {str(self.mode)}, proceed to Power On")
+            await self._send_set(FUNCTION_ONOFF, POWER_ON)
 
     def set_mode_dry(self):
         """Public method to set device to dry asynchronously."""

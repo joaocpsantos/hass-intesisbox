@@ -5,9 +5,14 @@ import asyncio
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 DOMAIN = "intesisbox"
 PLATFORMS = ["climate"]
+
+# Giving up lets Home Assistant retry this entry on its own schedule, instead
+# of holding up startup for every other integration.
+CONNECT_TIMEOUT = 30
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -18,8 +23,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     controller = intesisbox.IntesisBox(host, loop=hass.loop)
     controller.connect()
-    while not controller.is_connected:
-        await asyncio.sleep(0.1)
+    try:
+        async with asyncio.timeout(CONNECT_TIMEOUT):
+            while not controller.is_connected:
+                await asyncio.sleep(0.1)
+    except TimeoutError as err:
+        controller.stop()
+        raise ConfigEntryNotReady(
+            f"Timed out connecting to IntesisBox at {host}"
+        ) from err
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = controller
