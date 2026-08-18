@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import logging
+import time
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +42,12 @@ background_tasks = set()
 def clean_background_task(task):
     """Handle background task completion."""
     background_tasks.discard(task)
-    _ = task.result()  # to propagate exceptions
+    if task.cancelled():
+        _LOGGER.debug("Background task was cancelled")
+        return
+    exc = task.exception()
+    if exc is not None:
+        _LOGGER.error("Background task failed: %r", exc, exc_info=exc)
 
 
 def ensure_background_task(coro, loop):
@@ -72,6 +78,11 @@ class IntesisBox(asyncio.Protocol):
         self._rssi: int | None = None
         self._eventLoop = loop
 
+        # Diagnostics: make a silently dead socket visible in the log.
+        self._last_rx: float | None = None
+        self._last_tx: float | None = None
+        self._pending_sets: dict[str, tuple[str, float]] = {}
+
         # Limits
         self._operation_list: list[str] = []
         self._fan_speed_list: list[str] = []
@@ -101,6 +112,7 @@ class IntesisBox(asyncio.Protocol):
             _LOGGER.debug("Sending AMBTEMP")
             self._write("GET,1:AMBTEMP")
             await asyncio.sleep(10)
+            self._check_silence()
         else:
             _LOGGER.debug("Not connected, skipping Ambient Temp Request")
 
@@ -118,26 +130,103 @@ class IntesisBox(asyncio.Protocol):
             self._write(cmd)
             await asyncio.sleep(1)
 
+    def _silence(self) -> float | None:
+        """Seconds since the last byte was received, or None if nothing ever was."""
+        if self._last_rx is None:
+            return None
+        return time.monotonic() - self._last_rx
+
+    def _silence_text(self) -> str:
+        silence = self._silence()
+        return f"{silence:.0f}s ago" if silence is not None else "never"
+
+    def _can_write(self, cmd) -> bool:
+        """Report, loudly, when a command cannot reach the device."""
+        if self._transport is None:
+            _LOGGER.warning(
+                "%s: dropping %r, no transport (status=%s)",
+                self._ip,
+                cmd,
+                self._connectionStatus,
+            )
+            return False
+        if self._transport.is_closing():
+            _LOGGER.warning(
+                "%s: dropping %r, transport is closing (status=%s)",
+                self._ip,
+                cmd,
+                self._connectionStatus,
+            )
+            return False
+        return True
+
+    def _report_unconfirmed(self):
+        """Warn about commands the device never acknowledged."""
+        now = time.monotonic()
+        for uid, (value, sent_at) in list(self._pending_sets.items()):
+            if now - sent_at < 5:
+                continue
+            del self._pending_sets[uid]
+            _LOGGER.warning(
+                "%s: SET %s=%s sent %.0fs ago was never confirmed by the device "
+                "(last data received %s)",
+                self._ip,
+                uid,
+                value,
+                now - sent_at,
+                self._silence_text(),
+            )
+
+    def _check_silence(self):
+        """Warn when the device stopped answering on a socket we still hold open."""
+        self._report_unconfirmed()
+        silence = self._silence()
+        if silence is not None and silence > 60 and self.is_connected:
+            _LOGGER.warning(
+                "%s: no data received for %.0fs while still marked as connected. "
+                "WMP closes idle sockets after 60s, so commands are most likely "
+                "being dropped silently",
+                self._ip,
+                silence,
+            )
+
     def _write(self, cmd):
+        if not self._can_write(cmd):
+            return
         self._transport.write(f"{cmd}\r".encode("ascii"))
+        self._last_tx = time.monotonic()
         _LOGGER.debug(f"Data sent: {cmd!r}")
 
     async def _writeasync(self, cmd):
         """Async write to slow down commands and await response from units."""
-        self._transport.write(f"{cmd}\r".encode("ascii"))
-        _LOGGER.debug(f"Data sent: {cmd!r}")
+        if self._can_write(cmd):
+            self._transport.write(f"{cmd}\r".encode("ascii"))
+            self._last_tx = time.monotonic()
+            _LOGGER.debug(f"Data sent: {cmd!r}")
         await asyncio.sleep(1)
 
     def data_received(self, data):
         """Asyncio callback when data is received on the socket."""
         linesReceived = data.decode("ascii").splitlines()
         statusChanged = False
+        self._last_rx = time.monotonic()
 
         for line in linesReceived:
             _LOGGER.debug(f"Data received: {line!r}")
             cmdList = line.split(":", 1)
             cmd = cmdList[0]
             args = None
+            if len(cmdList) <= 1:
+                # ACK / ERR / PONG carry no colon and used to be discarded here
+                # without a trace.
+                bare = cmd.strip()
+                if bare == "ERR":
+                    _LOGGER.warning(
+                        "%s: device answered ERR, it rejected the last command",
+                        self._ip,
+                    )
+                elif bare:
+                    _LOGGER.debug("%s: device answered %r", self._ip, bare)
             if len(cmdList) > 1:
                 args = cmdList[1]
                 if cmd == "ID":
@@ -165,11 +254,11 @@ class IntesisBox(asyncio.Protocol):
             self._rssi = info[5]
 
             _LOGGER.debug(
-                "Updated info:",
-                f"model:{self._model}",
-                f"mac:{self._mac}",
-                f"version:{self._firmversion}",
-                f"rssi:{self._rssi}",
+                "Updated info: model:%s mac:%s version:%s rssi:%s",
+                self._model,
+                self._mac,
+                self._firmversion,
+                self._rssi,
             )
 
     def _parse_change_received(self, args):
@@ -178,6 +267,16 @@ class IntesisBox(asyncio.Protocol):
         if value in NULL_VALUES:
             value = None
         self._device[function] = value
+
+        pending = self._pending_sets.pop(function, None)
+        if pending is not None:
+            _LOGGER.debug(
+                "%s: device confirmed %s=%s, %.2fs after the command was sent",
+                self._ip,
+                function,
+                value,
+                time.monotonic() - pending[1],
+            )
 
         _LOGGER.debug(f"Updated state: {self._device!r}")
 
@@ -201,20 +300,22 @@ class IntesisBox(asyncio.Protocol):
                 self._horizontal_vane_list = values
 
             _LOGGER.debug(
-                "Updated limits: ",
-                f"{self._setpoint_minimum=}",
-                f"{self._setpoint_maximum=}",
-                f"{self._fan_speed_list=}",
-                f"{self._operation_list=}",
-                f"{self._vertical_vane_list=}",
-                f"{self._horizontal_vane_list=}",
+                f"Updated limits: {self._setpoint_minimum=} "
+                f"{self._setpoint_maximum=} {self._fan_speed_list=} "
+                f"{self._operation_list=} {self._vertical_vane_list=} "
+                f"{self._horizontal_vane_list=}"
             )
         return
 
     def connection_lost(self, exc):
         """Asyncio callback for a lost TCP connection."""
         self._connectionStatus = API_DISCONNECTED
-        _LOGGER.info("The server closed the connection")
+        _LOGGER.warning(
+            "%s: connection lost (exc=%r, last data received %s)",
+            self._ip,
+            exc,
+            self._silence_text(),
+        )
         self._send_update_callback()
 
     def connect(self):
@@ -241,7 +342,14 @@ class IntesisBox(asyncio.Protocol):
                 self._connectionStatus = API_DISCONNECTED
         elif self._connectionStatus == API_CONNECTING:
             _LOGGER.debug("connect() called but already connecting")
-            if self._transport.is_closing():
+            if self._transport is None:
+                _LOGGER.warning(
+                    "%s: stuck in %s with no transport, the previous connection "
+                    "attempt never completed",
+                    self._ip,
+                    API_CONNECTING,
+                )
+            elif self._transport.is_closing():
                 _LOGGER.debug(
                     "Socket is closing while trying to connect. Force reconnection"
                 )
@@ -282,10 +390,21 @@ class IntesisBox(asyncio.Protocol):
 
     def _set_value(self, uid: str, value: str | int) -> None:
         """Change a setting on the thermostat."""
+        # Anything still pending from an earlier press never got an answer.
+        self._report_unconfirmed()
+        _LOGGER.debug(
+            "%s: sending SET %s=%s (status=%s, last data received %s)",
+            self._ip,
+            uid,
+            value,
+            self._connectionStatus,
+            self._silence_text(),
+        )
+        self._pending_sets[uid] = (str(value), time.monotonic())
         try:
             asyncio.run(self._writeasync(f"SET,1:{uid},{value}"))
-        except Exception as e:
-            _LOGGER.error("%s Exception. %s / %s", type(e), e.args, e)
+        except Exception:
+            _LOGGER.exception("%s: failed to send SET %s=%s", self._ip, uid, value)
 
     def set_mode(self, mode):
         """Send mode and confirm change before turning on."""

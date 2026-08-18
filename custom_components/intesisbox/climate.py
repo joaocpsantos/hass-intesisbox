@@ -230,7 +230,10 @@ class IntesisBoxAC(ClimateEntity):
 
     def set_hvac_mode(self, operation_mode):
         """Set operation mode."""
-        _LOGGER.debug(f"set_hvac_mode({operation_mode=})")
+        _LOGGER.debug(
+            f"set_hvac_mode({operation_mode=}) on {self._devicename} "
+            f"(connected={self._controller.is_connected})"
+        )
         if operation_mode == HVACMode.OFF:
             self._controller.set_power_off()
             self._power = False
@@ -245,6 +248,10 @@ class IntesisBoxAC(ClimateEntity):
 
     def turn_on(self):
         """Turn thermostat on."""
+        _LOGGER.debug(
+            f"turn_on() on {self._devicename} "
+            f"(connected={self._controller.is_connected})"
+        )
         self._controller.set_power_on()
         self.schedule_update_ha_state(False)
 
@@ -278,6 +285,11 @@ class IntesisBoxAC(ClimateEntity):
     async def async_update(self):
         """Copy values from controller dictionary to climate device."""
         if not self._controller.is_connected:
+            _LOGGER.warning(
+                "%s: not connected, attempting to reconnect (attempt %d)",
+                self._devicename,
+                self._connection_retries + 1,
+            )
             await asyncio.sleep(
                 5
             )  # per device specs, wait minimum 1 second before re-connecting
